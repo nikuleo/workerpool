@@ -20,13 +20,18 @@ type Task func()
 
 type Pool struct {
 	capacity int
-	active   chan struct{}
-	tasks    chan Task
-	wg       sync.WaitGroup // 销毁时等待所有 worker 退出
-	quit     chan struct{}  // 通知各个 worker 退出的信号
+	preAlloc bool // 是否在创建pool的时候，就预创建workers，默认值为：false
+
+	// 当pool满的情况下，新的Schedule调用是否阻塞当前goroutine。默认值：true
+	// 如果block = false，则Schedule返回ErrNoWorkerAvailInPool
+	block  bool
+	active chan struct{}
+	tasks  chan Task
+	wg     sync.WaitGroup // 销毁时等待所有 worker 退出
+	quit   chan struct{}  // 通知各个 worker 退出的信号
 }
 
-func New(capacity int) *Pool {
+func New(capacity int, opts ...Option) *Pool {
 	if capacity <= 0 { // 防御性校验，当传入参数不合理是主动纠错
 		capacity = defaultCapacity
 	}
@@ -36,23 +41,52 @@ func New(capacity int) *Pool {
 
 	p := &Pool{
 		capacity: capacity,
+		block:    true,
 		tasks:    make(chan Task),
 		quit:     make(chan struct{}),
 		active:   make(chan struct{}, capacity),
 	}
 
-	fmt.Println("workerpool start")
+	for _, opt := range opts {
+		opt(p)
+	}
+	fmt.Printf("workerpool start(preAlloc=%t)\n", p.preAlloc)
+
+	if p.preAlloc {
+		for i := 0; i < p.capacity; i++ {
+			p.newWorker(i + 1)
+			p.active <- struct{}{}
+		}
+	}
 	go p.run()
 	return p
 }
 
 func (p *Pool) run() {
-	idx := 0 // 区分 worker 的编号
-	for {    // 不断循环监听 Pool 内的两个 channel。
+	idx := len(p.active)
+
+	if !p.preAlloc {
+	loop:
+		for t := range p.tasks {
+			p.returnTask(t)
+			select {
+			case <-p.quit:
+				return
+			case p.active <- struct{}{}:
+				idx++
+				p.newWorker(idx)
+			default:
+				break loop
+			}
+		}
+	}
+
+	for {
 		select {
-		case <-p.quit: // 接收到 quit channel 信号时退出。
+		case <-p.quit:
 			return
-		case p.active <- struct{}{}: // 当 active 可写时，创建一个新的 worker goroutine
+		case p.active <- struct{}{}:
+			// create a new worker
 			idx++
 			p.newWorker(idx)
 		}
@@ -90,6 +124,12 @@ func (p *Pool) Schedule(t Task) error {
 		return ErrWorkerPoolFreed
 	case p.tasks <- t:
 		return nil
+	default:
+		if p.block {
+			p.tasks <- t
+			return nil
+		}
+		return ErrNoIdleWorkerInPool
 	}
 }
 
@@ -97,4 +137,10 @@ func (p *Pool) Free() {
 	close(p.quit)
 	p.wg.Wait()
 	fmt.Printf("workerpool freed\n")
+}
+
+func (p *Pool) returnTask(t Task) {
+	go func() {
+		p.tasks <- t
+	}()
 }
