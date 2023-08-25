@@ -11,7 +11,6 @@ This is a tiny goroutine workerpool.
 - 接收 `func()` 类型任务
 - goroutine 复用
 - goroutine 分配任务
-- 可配置超时时间，任务执行超时自动退出
 
 
 ##  执行流程
